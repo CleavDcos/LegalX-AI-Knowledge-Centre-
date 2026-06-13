@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import ensure_directories, OPENAI_API_KEY, TOPICS
+from config import OPENAI_API_KEY, TOPICS
 from routers.audio import router as audio_router
 from routers.chat import router as chat_router
 from routers.keyinfo import router as keyinfo_router
@@ -17,7 +17,6 @@ from routers.search import router as search_router
 from routers.summary import router as summary_router
 from routers.topics import router as topics_router
 from routers.transcribe import router as transcribe_router
-from services.rag_service import process_missing_indexes_at_startup
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -30,29 +29,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Application lifespan — sequential disk indexing, lazy in-memory loading
+# Application lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Startup: create directories, then build any missing indexes to disk one PDF
-    at a time (with explicit memory cleanup after each). Indexes are loaded into
-    memory lazily on first request — never all at once at startup.
-    """
-    logger.info("LegalX backend starting up...")
-    ensure_directories()
-
-    if not OPENAI_API_KEY:
-        logger.warning(
-            "OPENAI_API_KEY is not set. AI features will fail until you add it to .env"
-        )
-    else:
-        logger.info("Building missing vector indexes (one PDF at a time)...")
-        process_missing_indexes_at_startup()
-        logger.info(
-            "Startup indexing complete. Indexes load into memory on first request."
-        )
-
+    """Startup and shutdown hooks."""
+    logger.info("LegalX backend started.")
     yield
     logger.info("LegalX backend shutting down.")
 
@@ -115,7 +97,7 @@ async def health_check():
         "topics_indexed": len(indexed_topics),
         "indexed_topics": indexed_topics,
         "topics_loaded_in_memory": get_loaded_topic_ids(),
-        "indexing_mode": "lazy_with_sequential_startup",
+        "indexing_mode": "lazy",
     }
 
 

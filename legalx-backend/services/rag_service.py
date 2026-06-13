@@ -95,8 +95,12 @@ def load_vector_store(topic_id: str) -> FAISS:
 def ensure_vector_store(topic_id: str) -> FAISS:
     """
     Lazily load or build a topic's FAISS index on first access.
-    Order: memory cache -> disk -> build from PDF.
-    Subsequent calls return the cached in-memory store.
+    1. Return from in-memory cache if already loaded.
+    2. Load from disk if index.faiss exists.
+    3. Otherwise build from PDF, save to disk, and cache in memory.
+
+    A per-topic threading lock ensures concurrent requests for the same topic
+    only trigger one build.
     """
     if topic_id not in TOPICS:
         raise KeyError(f"Unknown topic: {topic_id}")
@@ -106,6 +110,7 @@ def ensure_vector_store(topic_id: str) -> FAISS:
 
     lock = _build_locks.setdefault(topic_id, threading.Lock())
     with lock:
+        # Re-check after acquiring lock (another thread may have finished)
         if topic_id in _vector_stores:
             return _vector_stores[topic_id]
 
@@ -115,10 +120,7 @@ def ensure_vector_store(topic_id: str) -> FAISS:
             return load_vector_store(topic_id)
 
         logger.info("Lazily building vector store for topic '%s'", topic_id)
-        store = build_vector_store_for_topic(topic_id, keep_in_memory=True)
-        if store is None:
-            raise RuntimeError(f"Failed to build vector store for topic '{topic_id}'")
-        return store
+        return build_vector_store_for_topic(topic_id)
 
 
 def get_vector_store(topic_id: str) -> FAISS:
@@ -126,12 +128,8 @@ def get_vector_store(topic_id: str) -> FAISS:
     return ensure_vector_store(topic_id)
 
 
-def build_vector_store_for_topic(topic_id: str, *, keep_in_memory: bool = True) -> FAISS | None:
-    """
-    Build a new FAISS index from the topic's PDF: chunk, embed, and persist.
-    When keep_in_memory is False, the index is saved to disk only and large
-    intermediate objects are freed immediately (for low-memory startup builds).
-    """
+def build_vector_store_for_topic(topic_id: str) -> FAISS:
+    """Build a FAISS index from the topic PDF, persist to disk, and cache in memory."""
     topic_meta = TOPICS.get(topic_id)
     if not topic_meta:
         raise KeyError(f"Unknown topic: {topic_id}")
@@ -141,40 +139,9 @@ def build_vector_store_for_topic(topic_id: str, *, keep_in_memory: bool = True) 
     store = FAISS.from_documents(documents, embeddings)
     _release_memory(documents)
 
-    _persist_vector_store(topic_id, store)
-
-    if keep_in_memory:
-        _vector_stores[topic_id] = store
-        _release_memory(embeddings)
-        return store
-
-    _release_memory(store, embeddings)
-    logger.info("Released memory after building index for topic '%s'", topic_id)
-    return None
-
-
-def process_missing_indexes_at_startup() -> None:
-    """
-    Build any missing on-disk indexes one PDF at a time at startup.
-    Does not load indexes into memory — only persists to disk and frees RAM
-    after each topic to stay within low-memory server limits.
-    """
-    ensure_directories()
-
-    for topic_id in TOPICS:
-        if vector_store_exists(topic_id):
-            logger.info("Vector store already on disk for '%s', skipping", topic_id)
-            continue
-
-        try:
-            logger.info("Startup: building vector store for '%s'...", topic_id)
-            build_vector_store_for_topic(topic_id, keep_in_memory=False)
-        except FileNotFoundError as exc:
-            logger.warning("Startup: skipping topic '%s': %s", topic_id, exc)
-        except Exception as exc:
-            logger.error("Startup: failed to build topic '%s': %s", topic_id, exc)
-        finally:
-            _release_memory()
+    save_vector_store(topic_id, store)
+    _release_memory(embeddings)
+    return store
 
 
 def is_topic_ready(topic_id: str) -> bool:
