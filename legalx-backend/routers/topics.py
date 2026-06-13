@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from config import TOPICS
 from services.llm_service import generate_topic_description
-from services.rag_service import vector_store_exists
+from services.rag_service import is_topic_ready
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ async def list_topics():
 
     for topic_id, meta in TOPICS.items():
         short_description = ""
-        if vector_store_exists(topic_id):
+        if is_topic_ready(topic_id):
             try:
                 short_description = generate_topic_description(topic_id)
             except Exception as exc:

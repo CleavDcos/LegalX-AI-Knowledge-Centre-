@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from config import TOPICS
 from services.llm_service import chat_with_topic
-from services.rag_service import vector_store_exists
+from services.rag_service import ensure_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +41,16 @@ async def chat_about_topic(topic_id: str, body: ChatRequest):
     if topic_id not in TOPICS:
         raise HTTPException(status_code=404, detail=f"Topic '{topic_id}' not found.")
 
-    if not vector_store_exists(topic_id):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Topic '{topic_id}' is not yet indexed. Place the PDF in /data and restart.",
-        )
-
     try:
+        ensure_vector_store(topic_id)
         history = [{"role": h.role, "content": h.content} for h in body.history]
         result = chat_with_topic(topic_id, body.message, history)
         return ChatResponse(answer=result["answer"], sources=result["sources"])
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"PDF for topic '{topic_id}' not found in /data: {exc}",
+        )
     except Exception as exc:
         logger.error("Chat failed for '%s': %s", topic_id, exc)
         raise HTTPException(

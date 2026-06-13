@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from config import TOPICS
 from services.llm_service import generate_summary
-from services.rag_service import vector_store_exists
+from services.rag_service import ensure_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +25,15 @@ async def get_topic_summary(topic_id: str):
     if topic_id not in TOPICS:
         raise HTTPException(status_code=404, detail=f"Topic '{topic_id}' not found.")
 
-    if not vector_store_exists(topic_id):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Topic '{topic_id}' is not yet indexed. Place the PDF in /data and restart.",
-        )
-
     try:
+        ensure_vector_store(topic_id)
         summary = generate_summary(topic_id)
         return {"summary": summary}
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"PDF for topic '{topic_id}' not found in /data: {exc}",
+        )
     except Exception as exc:
         logger.error("Summary generation failed for '%s': %s", topic_id, exc)
         raise HTTPException(

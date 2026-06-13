@@ -1,6 +1,6 @@
 """
 LegalX AI Knowledge Centre — FastAPI Backend
-Main application entry point with startup PDF processing pipeline and CORS configuration.
+Main application entry point with lazy vector-store loading and CORS configuration.
 """
 
 import logging
@@ -17,7 +17,7 @@ from routers.search import router as search_router
 from routers.summary import router as summary_router
 from routers.topics import router as topics_router
 from routers.transcribe import router as transcribe_router
-from services.rag_service import process_all_topics_on_startup
+from services.rag_service import process_missing_indexes_at_startup
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -30,13 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Application lifespan — runs PDF processing pipeline on startup
+# Application lifespan — sequential disk indexing, lazy in-memory loading
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Startup: ensure directories exist, then index all PDFs into FAISS vector stores.
-    Skips topics whose vector store already exists on disk.
+    Startup: create directories, then build any missing indexes to disk one PDF
+    at a time (with explicit memory cleanup after each). Indexes are loaded into
+    memory lazily on first request — never all at once at startup.
     """
     logger.info("LegalX backend starting up...")
     ensure_directories()
@@ -46,9 +47,11 @@ async def lifespan(app: FastAPI):
             "OPENAI_API_KEY is not set. AI features will fail until you add it to .env"
         )
     else:
-        logger.info("Processing PDFs and building vector stores...")
-        process_all_topics_on_startup()
-        logger.info("Vector store initialization complete.")
+        logger.info("Building missing vector indexes (one PDF at a time)...")
+        process_missing_indexes_at_startup()
+        logger.info(
+            "Startup indexing complete. Indexes load into memory on first request."
+        )
 
     yield
     logger.info("LegalX backend shutting down.")
@@ -100,11 +103,9 @@ async def health_check():
     Health endpoint for monitoring and frontend loading states.
     Reports service status and which topics are indexed.
     """
-    from services.rag_service import vector_store_exists
+    from services.rag_service import get_loaded_topic_ids, is_topic_ready
 
-    indexed_topics = [
-        topic_id for topic_id in TOPICS if vector_store_exists(topic_id)
-    ]
+    indexed_topics = [topic_id for topic_id in TOPICS if is_topic_ready(topic_id)]
 
     return {
         "status": "healthy",
@@ -113,6 +114,8 @@ async def health_check():
         "topics_registered": len(TOPICS),
         "topics_indexed": len(indexed_topics),
         "indexed_topics": indexed_topics,
+        "topics_loaded_in_memory": get_loaded_topic_ids(),
+        "indexing_mode": "lazy_with_sequential_startup",
     }
 
 
