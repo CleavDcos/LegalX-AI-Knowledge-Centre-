@@ -1,7 +1,6 @@
 import axios from 'axios';
 
 const api = axios.create({ baseURL: 'https://legalx-ai-knowledge-centre.onrender.com' });
-
 export const getTopics = () => api.get('/api/topics');
 export const getSummary = (id: string) => api.get(`/api/topics/${id}/summary`);
 export const getKeyInfo = (id: string) => api.get(`/api/topics/${id}/keyinfo`);
