@@ -28,13 +28,43 @@ class SearchResponse(BaseModel):
 
 
 @router.get("/search", response_model=SearchResponse)
-async def search_topics(q: str = Query(..., min_length=1, description="Search query")):
+async def search_topics(
+    q: str = Query(..., min_length=1, description="Search query"),
+    topics: Optional[str] = Query(
+        None,
+        description="Comma-separated topic IDs to search (e.g. 'pocso,consumer'). "
+        "Max 3 topics. If not provided, searches 2-3 most recently accessed "
+        "available topics.",
+    ),
+):
     """
-    Search across ALL topic FAISS indexes.
-    Returns top 5 results with topic_id, topic_name, excerpt, and relevance score.
+    Search across topic FAISS indexes with smart memory management.
+
+    Query Parameters:
+    - q: Search query string (required)
+    - topics: Optional comma-separated topic IDs to search. If omitted, defaults
+      to searching 2-3 most recently accessed topics (or first available if none
+      have been accessed). Limited to 3 topics maximum to stay within 512MB memory.
+
+    Returns:
+    - results: Top 5 results with topic_id, topic_name, excerpt, and relevance score.
+    - query: The search query used.
     """
     try:
-        raw_results = search_all_topics(q, k=5)
+        # Parse optional topics parameter
+        topics_list = None
+        if topics:
+            # Split and strip whitespace
+            topics_list = [t.strip() for t in topics.split(",") if t.strip()]
+            if topics_list:
+                logger.info("Search query '%s' with topics: %s", q, topics_list)
+            else:
+                logger.info("Search query '%s' with default topics", q)
+                topics_list = None
+        else:
+            logger.info("Search query '%s' with default topics", q)
+
+        raw_results = search_all_topics(q, k=5, topics=topics_list)
         results = [
             SearchResult(
                 topic_id=r["topic_id"],

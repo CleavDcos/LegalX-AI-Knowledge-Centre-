@@ -7,7 +7,9 @@ Vector stores are built on first access (not at startup) and cached in memory.
 import gc
 import logging
 import threading
+from collections import deque
 from pathlib import Path
+from typing import Optional
 
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 _vector_stores: dict[str, FAISS] = {}
 # Per-topic locks to prevent duplicate builds on concurrent first requests
 _build_locks: dict[str, threading.Lock] = {}
+# Track recently accessed topic IDs (for search prioritization)
+# Maintains up to 3 most recently accessed topics
+_recent_topics: deque = deque(maxlen=3)
+_recent_topics_lock = threading.Lock()
 
 
 def _release_memory(*objects: object) -> None:
@@ -168,16 +174,117 @@ def retrieve_chunks_with_scores(
     return store.similarity_search_with_score(query, k=k)
 
 
-def search_all_topics(query: str, k: int = 5) -> list[dict]:
+def _load_vector_store_uncached(topic_id: str) -> FAISS:
     """
-    Search across existing topic FAISS indexes and return top results globally.
+    Load a FAISS index from disk without caching.
+    Used for sequential searching to minimize memory footprint.
+    Raises KeyError if no persisted index exists.
+    """
+    path = _vector_store_path(topic_id)
+    if not vector_store_exists(topic_id):
+        raise KeyError(f"No vector store found for topic '{topic_id}'")
+
+    embeddings = _get_embeddings()
+    store = FAISS.load_local(
+        str(path),
+        embeddings,
+        allow_dangerous_deserialization=True,
+    )
+    return store
+
+
+def _record_topic_access(topic_id: str) -> None:
+    """Record that a topic was accessed, updating the recent topics list."""
+    with _recent_topics_lock:
+        # Remove if already present to move it to the end (most recent)
+        if topic_id in _recent_topics:
+            _recent_topics.remove(topic_id)
+        _recent_topics.append(topic_id)
+
+
+def _get_default_search_topics() -> list[str]:
+    """
+    Get the default list of topics to search (up to 3).
+    Prioritizes: most recently accessed topics that have indexes built.
+    Falls back to first available built indexes if no recent access.
+    """
+    with _recent_topics_lock:
+        recent_list = list(_recent_topics)  # Get snapshot of recent topics
+
+    # Collect available topics with built indexes
+    available_topics = [
+        topic_id
+        for topic_id in TOPICS.keys()
+        if vector_store_exists(topic_id)
+    ]
+
+    if not available_topics:
+        logger.warning("No built topic indexes available for search")
+        return []
+
+    # Start with most recently accessed that have built indexes, up to 3
+    default_topics = [t for t in reversed(recent_list) if t in available_topics][
+        :3
+    ]
+
+    # If fewer than 2 recent topics, fill with other available topics
+    if len(default_topics) < 2:
+        other_topics = [t for t in available_topics if t not in default_topics]
+        default_topics.extend(other_topics[: 2 - len(default_topics)])
+
+    return default_topics[:3]  # Limit to 3 maximum
+
+
+def search_all_topics(
+    query: str, k: int = 5, topics: Optional[list[str]] = None
+) -> list[dict]:
+    """
+    Search across topic FAISS indexes sequentially, one at a time.
+    Processes topics sequentially to minimize memory usage:
+    1. Load a topic's FAISS index from disk (uncached)
+    2. Perform the similarity search
+    3. Extract results
+    4. Delete the index object and call gc.collect()
+    5. Repeat for next topic
+
+    Args:
+        query: Search query string.
+        k: Maximum number of results to return.
+        topics: Optional list of topic IDs to search. If None, searches up to 3
+                most recently accessed topics (or first available if none accessed).
+                Searches are limited to 2-3 topics maximum to minimize memory usage.
+
     Only searches indexes that already exist on disk; skips topics with missing
-    vector stores to avoid out-of-memory errors when building indexes on demand.
-    Results are merged and ranked by relevance score.
+    vector stores. Returns top-k results globally ranked by relevance score.
     """
+    # Determine which topics to search
+    if topics is None:
+        topics_to_search = _get_default_search_topics()
+        logger.debug(
+            "Using default topic selection (2-3 most recent/available): %s",
+            topics_to_search,
+        )
+    else:
+        # Limit to 3 topics maximum
+        topics_to_search = topics[:3]
+        logger.debug("Searching user-specified topics: %s", topics_to_search)
+
+    if not topics_to_search:
+        logger.warning(
+            "No topics available to search. Ensure vector stores are built first."
+        )
+        return []
+
     all_results: list[dict] = []
 
-    for topic_id, meta in TOPICS.items():
+    for topic_id in topics_to_search:
+        # Validate topic exists
+        if topic_id not in TOPICS:
+            logger.warning("Unknown topic '%s': skipping", topic_id)
+            continue
+
+        meta = TOPICS[topic_id]
+
         # Skip topics whose vector store hasn't been built yet
         if not vector_store_exists(topic_id):
             logger.warning(
@@ -187,8 +294,19 @@ def search_all_topics(query: str, k: int = 5) -> list[dict]:
             )
             continue
 
+        store = None
         try:
-            scored = retrieve_chunks_with_scores(topic_id, query, k=k)
+            # Load FAISS index (uncached) for this topic only
+            logger.debug("Loading vector store for topic '%s' to search", topic_id)
+            store = _load_vector_store_uncached(topic_id)
+
+            # Record topic access for future default selection
+            _record_topic_access(topic_id)
+
+            # Perform similarity search
+            scored = store.similarity_search_with_score(query, k=k)
+
+            # Extract results while store is still in memory
             for doc, score in scored:
                 all_results.append(
                     {
@@ -199,8 +317,22 @@ def search_all_topics(query: str, k: int = 5) -> list[dict]:
                         "metadata": doc.metadata,
                     }
                 )
+
+            logger.debug(
+                "Searched topic '%s': extracted %d results",
+                topic_id,
+                len(scored),
+            )
         except Exception as exc:
             logger.warning("Search failed for topic '%s': %s", topic_id, exc)
+        finally:
+            # Explicitly release the FAISS index and run garbage collection
+            # to ensure only one index is held in memory at a time
+            if store is not None:
+                _release_memory(store)
+                logger.debug(
+                    "Released vector store for topic '%s' from memory", topic_id
+                )
 
     # Lower FAISS L2 distance means more similar — sort ascending
     all_results.sort(key=lambda x: x["relevance_score"])
