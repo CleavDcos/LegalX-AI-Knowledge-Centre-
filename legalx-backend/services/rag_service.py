@@ -170,13 +170,23 @@ def retrieve_chunks_with_scores(
 
 def search_all_topics(query: str, k: int = 5) -> list[dict]:
     """
-    Search across topic FAISS indexes and return top results globally.
-    Each topic is loaded or built lazily on first search; results are merged
-    and ranked by relevance score.
+    Search across existing topic FAISS indexes and return top results globally.
+    Only searches indexes that already exist on disk; skips topics with missing
+    vector stores to avoid out-of-memory errors when building indexes on demand.
+    Results are merged and ranked by relevance score.
     """
     all_results: list[dict] = []
 
     for topic_id, meta in TOPICS.items():
+        # Skip topics whose vector store hasn't been built yet
+        if not vector_store_exists(topic_id):
+            logger.warning(
+                "Skipping topic '%s' (%s): vector store not yet built on disk",
+                topic_id,
+                meta["name"],
+            )
+            continue
+
         try:
             scored = retrieve_chunks_with_scores(topic_id, query, k=k)
             for doc, score in scored:
@@ -189,8 +199,6 @@ def search_all_topics(query: str, k: int = 5) -> list[dict]:
                         "metadata": doc.metadata,
                     }
                 )
-        except FileNotFoundError as exc:
-            logger.warning("Skipping topic '%s' in search: %s", topic_id, exc)
         except Exception as exc:
             logger.warning("Search failed for topic '%s': %s", topic_id, exc)
 
