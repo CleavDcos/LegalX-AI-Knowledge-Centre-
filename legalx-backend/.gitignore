@@ -10,8 +10,7 @@ venv/
 env/
 .venv/
 
-# Vector store (will rebuild on startup)
-vector_store/
+
 
 # Cache (will rebuild on startup)
 cache/
